@@ -416,7 +416,7 @@ builder.add_edge("leave_skill", "primary_assistant")
 
 builder.add_node(
     "enter_dietary_intake",
-    create_entry_node("Car Rental Assistant", "dietary_intake"),
+    create_entry_node("Ditary Intake Assitant", "dietary_intake"),
 )
 builder.add_node("dietary_intake", Assistant(dietary_intake_runnable))
 builder.add_edge("enter_dietary_intake", "dietary_intake")
@@ -534,11 +534,18 @@ import shutil
 import uuid
 
 # Let's create an example conversation a user might have with the assistant
-tutorial_questions = [
+tutorial_questions1 = [
     "Hi there, I am Dan Doss",
     "Yes, Please",
     "My email is ddoss@gmail.com, I am 53 years old and Male",
     "I have hypertension condition and I am allegic to eggs",
+]
+
+tutorial_questions = [
+    "Hi there, I am Dan Doss",
+    "I would like to enter my today's dietary intake",
+    "I had a bag of potato chips, 16oz soda, half a pound steak",
+    "Thank you",
 ]
 
 # Update with the backup file so we can restart from the original place in each section
