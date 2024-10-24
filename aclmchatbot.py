@@ -21,6 +21,7 @@ from langchain_core.tools import tool
 from pydantic import BaseModel, Field
 from typing import Callable
 
+standalone = True
 
 def handle_tool_error(state) -> dict:
     error = state.get("error")
@@ -248,10 +249,10 @@ primary_assistant_prompt = ChatPromptTemplate.from_messages(
             "Your primary role is to help answer users basic questions about their diet, exising medical conditions and any dietart restrictions associated with it. "
             "You are SQL expert with a strong attention to detail"
             "You greet the users and ask for their full name, including first and lastname. "
-           "- if the user fail to provide first and lastnames generate a message to ask for them. Append STOP to the message."
+           "- if the user fail to provide first and lastnames generate a message to ask for them."
            "- if you have user first and last names, you output a syntactically correct MySQL query to find the user in the Users table."
            "- If you get an error while executing a query, rewrite the query and try again."
-           "- If you do not find the user Users table, generate a mesage to ask if the user would like to enroll. Append STOP to the message."
+           "- If you do not find the user Users table, generate a mesage to ask if the user would like to enroll."
             "If a user wish to enroll into the system, "
             "delegate the task to the appropriate specialized assistant by invoking the corresponding tool. You are not able to make these types of changes yourself."
             " Only the specialized assistants are given permission to do this for the user."
@@ -548,6 +549,13 @@ tutorial_questions = [
     "Thank you",
 ]
 
+tutorial_questions = [
+    "Hi there, I am Mike Rodolph",
+    "Yes, Please",
+    "My email is mrodolph@gmail.com, I am 53 years old and Male",
+    "I have hypertension condition and I am allegic to eggs",
+    "Thank You",
+]
 # Update with the backup file so we can restart from the original place in each section
 thread_id = str(uuid.uuid4())
 
@@ -561,44 +569,73 @@ config = {
     }
 }
 
+
 _printed = set()
-# We can reuse the tutorial questions from part 1 to see how it does.
-for question in tutorial_questions:
-    events = part_4_graph.stream(
-        {"messages": ("user", question)}, config, stream_mode="values"
-    )
-    for event in events:
-        _print_event(event, _printed)
-    snapshot = part_4_graph.get_state(config)
-    while snapshot.next:
-        # We have an interrupt! The agent is trying to use a tool, and the user can approve or deny it
-        # Note: This code is all outside of your graph. Typically, you would stream the output to a UI.
-        # Then, you would have the frontend trigger a new run via an API call when the user has provided input.
-        try:
-            user_input = input(
-                "Do you approve of the above actions? Type 'y' to continue;"
-                " otherwise, explain your requested changed.\n\n"
-            )
-        except:
-            user_input = "y"
-        if user_input.strip() == "y":
-            # Just continue
-            result = part_4_graph.invoke(
-                None,
-                config,
-            )
-        else:
-            # Satisfy the tool invocation by
-            # providing instructions on the requested changes / change of mind
-            result = part_4_graph.invoke(
-                {
-                    "messages": [
-                        ToolMessage(
-                            tool_call_id=event["messages"][-1].tool_calls[0]["id"],
-                            content=f"API call denied by user. Reasoning: '{user_input}'. Continue assisting, accounting for the user's input.",
-                        )
-                    ]
-                },
-                config,
-            )
+if standalone:
+    # We can reuse the tutorial questions from part 1 to see how it does.
+    for question in tutorial_questions:
+        events = part_4_graph.stream(
+            {"messages": ("user", question)}, config, stream_mode="values"
+        )
+        for event in events:
+            _print_event(event, _printed)
         snapshot = part_4_graph.get_state(config)
+        while snapshot.next:
+            # We have an interrupt! The agent is trying to use a tool, and the user can approve or deny it
+            # Note: This code is all outside of your graph. Typically, you would stream the output to a UI.
+            # Then, you would have the frontend trigger a new run via an API call when the user has provided input.
+            try:
+                user_input = input(
+                    "Do you approve of the above actions? Type 'y' to continue;"
+                    " otherwise, explain your requested changed.\n\n"
+                )
+            except:
+                user_input = "y"
+            if user_input.strip() == "y":
+                # Just continue
+                result = part_4_graph.invoke( None, config,)
+            else:
+                # Satisfy the tool invocation by
+                # providing instructions on the requested changes / change of mind
+                result = part_4_graph.invoke(
+                    {
+                        "messages": [
+                            ToolMessage(
+                                tool_call_id=event["messages"][-1].tool_calls[0]["id"],
+                                content=f"API call denied by user. Reasoning: '{user_input}'. Continue assisting, accounting for the user's input.",
+                            )
+                        ]
+                    },
+                    config,
+                )
+            snapshot = part_4_graph.get_state(config)
+else:
+     import streamlit as st
+     x = """
+     with st.sidebar:
+         openai_api_key = st.text_input("OpenAI API Key", key="chatbot_api_key", type="password")
+         "[Get an OpenAI API key](https://platform.openai.com/account/api-keys)"
+         "[View the source code](https://github.com/streamlit/llm-examples/blob/main/Chatbot.py)"
+         "[![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/streamlit/llm-examples?quickstart=1)"
+     """
+
+     st.title("💬 ACLM")
+     st.caption("🚀 A Chatbot powered by OpenAI")
+     if "messages" not in st.session_state:
+         st.session_state["messages"] = [{"role": "assistant", "content": "Welcome to ACML. Who am I speaking with?"}]
+
+     for msg in st.session_state.messages:
+         st.chat_message(msg["role"]).write(msg["content"])
+
+     if prompt := st.chat_input():
+         st.session_state.messages.append({"role": "user", "content": prompt})
+         st.chat_message("user").write(prompt)
+         #prompt += ". Also generate follow up questions"
+         events = part_4_graph.stream(
+            {"messages": ("user", prompt)}, config, stream_mode="values"
+         )
+         for event in events:
+             _print_event(event, _printed)
+         msg = event['messages'][-1].content
+         st.session_state.messages.append({"role": "assistant", "content": msg})
+         st.chat_message("assistant").write(msg)
