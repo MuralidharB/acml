@@ -1,4 +1,10 @@
 from  datetime import datetime
+import os # read API key from environment variables. Not required if you are specifying the key in notebook.
+import re
+import json # used to create a json to store snippets and embeddings
+import numpy as np
+from numpy import dot # used to match user questions with snippets.
+
 from typing import Annotated, Literal, Optional
 
 from typing_extensions import TypedDict
@@ -21,7 +27,91 @@ from langchain_core.tools import tool
 from pydantic import BaseModel, Field
 from typing import Callable
 
+from PyPDF2 import PdfReader # used to extract text from pdf
+from langchain.text_splitter import CharacterTextSplitter # split text in smaller snippets
+
+import openai
+from openai import OpenAI # used to access openai api
+
 standalone = True
+
+##################################################################
+#  Create embedding for questionaire                             #
+##################################################################
+
+"""### Parameters specifying different variables used in the code"""
+
+EXTRACTED_TEXT_FILE_PATH = "pdf_text.txt" # text extracted from pdf
+EXTRACTED_JSON_PATH = "extracted.json" # snippets and embeddings
+OPENAI_API_KEY = os.environ['OPENAI_API_KEY'] # replace this with your openai api key or store the api key in env
+EMBEDDING_MODEL = "text-embedding-ada-002" # embedding model used
+GPT_MODEL = "gpt-4-turbo-preview" # gpt model used. alternatively you can use gpt-4 or other models.
+CHUNK_SIZE = 1000 # chunk size to create snippets
+CHUNK_OVERLAP = 200 # check size to create overlap between snippets
+CONFIDENCE_SCORE = 0.75 # specify confidence score to filter search results. [0,1] prefered: 0.75
+PDF_FILE_PATH = "ACLM-Diet-Screener-V1 in color.pdf"
+
+def extract_text_from_pdf(pdf_file_path: str):
+
+    # Open the PDF file using the specified file_path
+    reader = PdfReader(pdf_file_path)
+    # Get the total number of pages in the PDF
+    number_of_pages = len(reader.pages)
+
+    # Initialize an empty string to store extracted text
+    pdf_text = ""
+
+    # Loop through each page of the PDF
+    for i in range(number_of_pages):
+        # Get the i-th page
+        page = reader.pages[i]
+        # Extract text from the page and append it to pdf_text
+        pdf_text += page.extract_text()
+        # Add a newline after each page's text for readability
+        pdf_text += "\n"
+
+    # Specify the file path for the new text file
+    file_path = EXTRACTED_TEXT_FILE_PATH
+
+    # Write the content to the text file
+    with open(file_path, "w", encoding="utf-8") as file:
+        file.write(pdf_text)
+
+    return pdf_text
+
+
+docs = [{"page_content": txt} for txt in re.split(r"(?=\n##)", extract_text_from_pdf(PDF_FILE_PATH))]
+
+
+class VectorStoreRetriever:
+    def __init__(self, docs: list, vectors: list, oai_client):
+        self._arr = np.array(vectors)
+        self._docs = docs
+        self._client = oai_client
+
+    @classmethod
+    def from_docs(cls, docs, oai_client):
+        embeddings = oai_client.embeddings.create(
+            model="text-embedding-3-small", input=[doc["page_content"] for doc in docs]
+        )
+        vectors = [emb.embedding for emb in embeddings.data]
+        return cls(docs, vectors, oai_client)
+
+    def query(self, query: str, k: int = 5) -> list[dict]:
+        embed = self._client.embeddings.create(
+            model="text-embedding-3-small", input=[query]
+        )
+        # "@" is just a matrix multiplication in python
+        scores = np.array(embed.data[0].embedding) @ self._arr.T
+        top_k_idx = np.argpartition(scores, -k)[-k:]
+        top_k_idx_sorted = top_k_idx[np.argsort(-scores[top_k_idx])]
+        return [
+            {**self._docs[idx], "similarity": scores[idx]} for idx in top_k_idx_sorted
+        ]
+
+
+retriever = VectorStoreRetriever.from_docs(docs, openai.Client())
+
 
 def handle_tool_error(state) -> dict:
     error = state.get("error")
@@ -59,9 +149,9 @@ def _print_event(event: dict, _printed: set, max_length=1500):
             _printed.add(message.id)
 
 
-db = SQLDatabase.from_uri("mysql://root@localhost/acml")
+db = SQLDatabase.from_uri("mysql://root@localhost/aclm")
 
-toolkit = SQLDatabaseToolkit(db=db, llm=ChatOpenAI(model="gpt-4o"))
+toolkit = SQLDatabaseToolkit(db=db, llm=ChatOpenAI(model=GPT_MODEL))
 tools = toolkit.get_tools()
 
 list_tables_tool = next(tool for tool in tools if tool.name == "sql_db_list_tables")
@@ -79,6 +169,15 @@ def db_query_tool(query: str) -> str:
         #return "Error: Query failed. Please rewrite your query and try again."
     #print(result)
     return result
+
+
+@tool
+def lookup_questionaire(query: str) -> str:
+    """Consult the ACLM questionaire that a newly enrolled must fill in.
+    The user enrollment is not completed successfully until all the questions in the
+    questionaire are answered"""
+    docs = retriever.query(query, k=2)
+    return "\n\n".join([doc["page_content"] for doc in docs])
 
 
 def update_dialog_stack(left: list[str], right: Optional[str]) -> list[str]:
@@ -149,7 +248,7 @@ class CompleteOrEscalate(BaseModel):
         }
 
 
-llm = ChatOpenAI(model="gpt-4-turbo-preview")
+llm = ChatOpenAI(model=GPT_MODEL)
 # Flight booking assistant
 
 new_user_prompt = ChatPromptTemplate.from_messages(
@@ -180,20 +279,18 @@ dietary_intake_prompt = ChatPromptTemplate.from_messages(
     [
         (
             "system",
-            "You are a specialized assistant for handling user daily daiatery intake. "
+            "You are a specialized assistant for handling user daily daiatery intake. You will encourage the user to "
+            "fill in all the questions in ACLM questionaire. Since remembering last four weeks of diet is hard "
+            "you will encourage user to fill in most common food that user consumes daily and then ask for any exceptions "
+            "including attending parties, going to a restaurant and other ways people consume food."
             "The primary assistant delegates work to you whenever the user needs record his daily dietery intake. "
-            "Ask user his dietary intake. "
-            "When asking user, Be persistent. Encourage user to enter all the food he had consumed on that day. "
+            "When asking user, Be persistent. Encourage user to enter as much accurate information as possible. "
             "If the user changes their mind, escalate the task back to the main assistant."
             " Remember that recording dietary intake isn't completed until after the relevant tool has successfully been used."
             '\n\nIf the user needs help, and none of your tools are appropriate for it, then "CompleteOrEscalate" the dialog to the host assistant.'
             " Do not waste the user's time. Do not make up invalid tools or functions."
             "\n\nSome examples for which you should CompleteOrEscalate:\n"
-            " - 'what's the weather like this time of year?'\n"
-            " - 'nevermind i think I'll book separately'\n"
-            " - 'i need to figure out transportation while i'm there'\n"
-            " - 'Oh wait i haven't booked my flight yet i'll do that first'\n"
-            " - 'Hotel booking confirmed'",
+            " - 'nevermind i think I'll fill them later'\n"
         ),
         ("placeholder", "{messages}"),
     ]
@@ -247,12 +344,12 @@ primary_assistant_prompt = ChatPromptTemplate.from_messages(
             "system",
             "You are a helpful customer support assistant for American College of Lifestyle Medicine. "
             "Your primary role is to help answer users basic questions about their diet, exising medical conditions and any dietart restrictions associated with it. "
-            "You are SQL expert with a strong attention to detail"
+            "You are also a SQL expert with a strong attention to detail"
             "You greet the users and ask for their full name, including first and lastname. "
-           "- if the user fail to provide first and lastnames generate a message to ask for them."
-           "- if you have user first and last names, you output a syntactically correct MySQL query to find the user in the Users table."
-           "- If you get an error while executing a query, rewrite the query and try again."
-           "- If you do not find the user Users table, generate a mesage to ask if the user would like to enroll."
+                "- if the user fail to provide first and lastnames generate a message to ask for them."
+                "- if you have user first and last names, you output a syntactically correct MySQL query to find the user in the Users table."
+                "- If you get an error while executing a query, rewrite the query and try again."
+                "- If you do not find the user Users table, generate a mesage to ask if the user would like to enroll."
             "If a user wish to enroll into the system, "
             "delegate the task to the appropriate specialized assistant by invoking the corresponding tool. You are not able to make these types of changes yourself."
             " Only the specialized assistants are given permission to do this for the user."
@@ -260,6 +357,9 @@ primary_assistant_prompt = ChatPromptTemplate.from_messages(
             "Provide detailed information to the user, and always double-check the database before concluding that information is unavailable. "
             " When searching, be persistent. Expand your query bounds if the first search returns no results. "
             " If a search comes up empty, expand your search before giving up."
+            "User enrollment is not complete until the user fills in their dietary intake for the four weeks so you will delegate the request to a assistant who "
+            "can guide the user into filling the questionaire"
+
         ),
         ("placeholder", "{messages}"),
     ]
@@ -334,7 +434,7 @@ builder.add_node(
 builder.add_node("get_schema_tool", create_tool_node_with_fallback([get_schema_tool]))
 
 # Add a node for a model to choose the relevant tables based on the question and available tables
-model_get_schema = ChatOpenAI(model="gpt-4o", temperature=0).bind_tools(
+model_get_schema = ChatOpenAI(model=GPT_MODEL, temperature=0).bind_tools(
     [get_schema_tool]
 )
 builder.add_node(
@@ -573,12 +673,16 @@ config = {
 _printed = set()
 if standalone:
     # We can reuse the tutorial questions from part 1 to see how it does.
-    for question in tutorial_questions:
+    #for question in tutorial_questions:
+    question = input("I am your ACLM assistant, How may I help you today?")
+    while not "bye" in question:
         events = part_4_graph.stream(
             {"messages": ("user", question)}, config, stream_mode="values"
         )
         for event in events:
-            _print_event(event, _printed)
+            pass
+            #_print_event(event, _printed)
+        print(event['messages'][-1].content)
         snapshot = part_4_graph.get_state(config)
         while snapshot.next:
             # We have an interrupt! The agent is trying to use a tool, and the user can approve or deny it
@@ -609,6 +713,7 @@ if standalone:
                     config,
                 )
             snapshot = part_4_graph.get_state(config)
+        question = input("")
 else:
      import streamlit as st
      x = """
